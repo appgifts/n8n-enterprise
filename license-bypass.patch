@@ -7,8 +7,8 @@ index 6609f05d80..29d3cc2686 100644
  
  	isLicensed(feature: BooleanLicenseFeature) {
 -		return this.manager?.hasFeatureEnabled(feature) ?? false;
-+    // 🚀 BYPASS: Always return true for all features except showNonProdBanner
-+    if (feature === LICENSE_FEATURES.SHOW_NON_PROD_BANNER) {
++    // 🚀 BYPASS: Always return true for all features except showNonProdBanner and API disabled
++    if ([LICENSE_FEATURES.SHOW_NON_PROD_BANNER, LICENSE_FEATURES.API_DISABLED].includes(feature)) {
 +      return false;
 +    }
 +    return true;
