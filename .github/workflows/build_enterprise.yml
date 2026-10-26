@@ -1,0 +1,142 @@
+name: Build n8n
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Check Version and Registry
+        id: registry-check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. Temporarily download and extract stable to read package.json version
+          curl -L https://github.com/n8n-io/n8n/archive/refs/tags/stable.zip -o stable.zip
+          unzip -q stable.zip
+          EXTRACTED_FOLDER=$(ls -d n8n-* | head -n 1)
+
+          VERSION=$(node -p "require('./$EXTRACTED_FOLDER/package.json').version")
+          echo "Extracted version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Clean up temporary files
+          rm -rf stable.zip $EXTRACTED_FOLDER
+
+          # 2. Check if package registry already contains this tag
+          OWNER="${{ github.repository_owner }}"
+          EXISTS=$(node -e '
+            const https = require("https");
+            const token = process.env.GITHUB_TOKEN;
+            const owner = `'"$OWNER"'`;
+            const version = `'"$VERSION"'`;
+            
+            const options = {
+              hostname: "api.github.com",
+              path: `/users/${owner}/packages/container/n8n/versions`,
+              headers: {
+                "User-Agent": "GitHub-Action",
+                "Authorization": `Bearer ${token}`,
+                "Accept": "application/vnd.github+json"
+              }
+            };
+
+            https.get(options, (res) => {
+              let data = "";
+              res.on("data", chunk => data += chunk);
+              res.on("end", () => {
+                try {
+                  const versions = JSON.parse(data);
+                  if (Array.isArray(versions)) {
+                    const exists = versions.some(v => 
+                      v.metadata?.container?.tags?.includes(version)
+                    );
+                    console.log(`EXISTS=${exists}`);
+                  } else {
+                    console.log("EXISTS=false");
+                  }
+                } catch(e) {
+                  console.log("EXISTS=false");
+                }
+              });
+            }).on("error", () => {
+              console.log("EXISTS=false");
+            });
+          ' | grep "EXISTS=" | cut -d'=' -f2)
+
+          echo "exists=${EXISTS:-false}" >> $GITHUB_OUTPUT
+
+      - name: Stop if version exists
+        if: steps.registry-check.outputs.exists == 'true'
+        run: |
+          echo "Version ${{ steps.registry-check.outputs.version }} already exists in the package registry. Stopping workflow."
+          exit 0
+
+      - name: Download and Extract Source
+        if: steps.registry-check.outputs.exists != 'true'
+        run: |
+          curl -L https://github.com/n8n-io/n8n/archive/refs/tags/stable.zip -o stable.zip
+          unzip -q stable.zip
+          EXTRACTED_FOLDER=$(ls -d n8n-* | head -n 1)
+          rsync -a "$EXTRACTED_FOLDER"/ ./
+          rm -rf "$EXTRACTED_FOLDER" stable.zip
+
+      - name: Apply Patch
+        if: steps.registry-check.outputs.exists != 'true' && hashFiles('license-bypass.patch') != ''
+        run: |
+          patch -p1 < license-bypass.patch
+
+      - name: Log in to GitHub Container Registry
+        if: steps.registry-check.outputs.exists != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Docker image (Version Tag)
+        if: steps.registry-check.outputs.exists != 'true'
+        uses: ./.github/actions/setup-nodejs
+        with:
+          build-command: "pnpm build:docker"
+          enable-docker-cache: true
+          docker-cache-key: n8n-io/n8n
+        env:
+          IMAGE_BASE_NAME: "ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/n8n"
+          RUNNERS_IMAGE_BASE_NAME: "ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/runners"
+          IMAGE_TAG: ${{ steps.registry-check.outputs.version }}
+
+      - name: Tag and Push as Latest
+        if: steps.registry-check.outputs.exists != 'true'
+        env:
+          GH_PAT: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.repository_owner }}
+          VERSION: ${{ steps.registry-check.outputs.version }}
+        run: |
+          # Log in to GHCR via Docker CLI
+          echo "$GH_PAT" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+
+          # For the main n8n image
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/n8n:latest \
+            ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/n8n:$VERSION
+
+          # For the runners image
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/runners:latest \
+            ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/runners:$VERSION
